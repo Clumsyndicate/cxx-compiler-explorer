@@ -30,7 +30,9 @@ export class CompilationDatabase implements Disposable {
         this.watcher = workspace.createFileSystemWatcher(this.compileCommandsFile.path);
 
         const load = async () => {
+            getOutputChannel().appendLine(`Loading compile commands1`);
             this.commands = await CompilationDatabase.load(this.compileCommandsFile);
+            getOutputChannel().appendLine(`Loaded compile commands1`);
         };
         this.watcher.onDidChange(async () => await load());
         this.watcher.onDidDelete(() => {
@@ -45,8 +47,9 @@ export class CompilationDatabase implements Disposable {
         const compileCommandsFile = Uri.joinPath(Uri.parse(buildDirectory), 'compile_commands.json');
 
         let compdb = CompilationDatabase.compdbs.get(compileCommandsFile);
-        if (compdb) return compdb;
-
+        if (compdb) {
+            return compdb;
+        }
         const commands = await CompilationDatabase.load(compileCommandsFile);
 
         compdb = new CompilationDatabase(compileCommandsFile, commands);
@@ -56,12 +59,18 @@ export class CompilationDatabase implements Disposable {
     }
 
     get(srcUri: Uri): CompileCommand | undefined {
-        return this.commands.get(srcUri.fsPath);
+        const buildDirectory = resolvePath(workspace.getConfiguration('compilerexplorer')
+            .get<string>('compilationDirectory', '${workspaceFolder}'), srcUri);
+        // const abs_filepath = Uri.joinPath(Uri.parse(buildDirectory), srcUri.fsPath);
+        const relativeFp = srcUri.fsPath.replace(buildDirectory+"/", "");
+
+        getOutputChannel().appendLine(`get command for file ${relativeFp}`);
+        return this.commands.get(relativeFp);
     }
 
     async compile(src: Uri, customCommand: string[]): Promise<string> {
         const ccommand = this.get(src);
-        if (!ccommand) throw new Error("cannot find compilation command");
+        if (!ccommand) throw new Error("cannot find compilation command " + src);
 
         // cancel possible previous compilation
         this.compileCancellationTokenSource?.cancel();
@@ -109,15 +118,17 @@ export class CompilationDatabase implements Disposable {
 
         let ccommands = new Map<string, CompileCommand>();
         for (let command of commands) {
+            getOutputChannel().appendLine(`command: ${JSON.stringify(command)}`);
             ccommands.set(command.file, command);
         }
+        getOutputChannel().appendLine(`ccommands size: ${ccommands.size}`);
 
         return ccommands;
     }
 
     private static preprocess(commands: CompileCommand[]) {
         for (let ccommand of commands) {
-            ccommand.arguments = constructCompileCommand(ccommand.command, ccommand.arguments);
+            ccommand.arguments = constructCompileCommand(ccommand.command, ccommand.arguments, ccommand.directory);
             ccommand.arguments = ccommand.arguments.filter((arg) => arg != ccommand.file);
             ccommand.command = "";
         }
@@ -126,24 +137,61 @@ export class CompilationDatabase implements Disposable {
     private async runCompiler(ctok: CancellationToken, ccommand: CompileCommand, customCommand: string[]): Promise<string> {
         const compileArguments = customCommand.length != 0 ? customCommand : ccommand.arguments;
         const cxxfiltExe = await this.getCxxFiltExe(compileArguments[0]);
-        const command = compileArguments[0];
-        const args = [...compileArguments.slice(1), ccommand.file, '-g', '-S', '-o', '-'];
+        const command =
+            // "BAZEL_USE_CPP_ONLY_TOOLCHAIN=1 " +
+            // "DEVELOPER_DIR=\"/Applications/Xcode.app/Contents/Developer\" " +
+            // "SDKROOT=\"/Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX13.3.sdk\" " +
+            compileArguments[0];
+
+        var args = [...compileArguments.slice(1), workspace.workspaceFolders[0].uri.path + "/" + ccommand.file, '-g', '-S', '-o', '-'];
+        getOutputChannel().appendLine(`args: ${command} ${args}`);
+
+        args = args.map(item => (item === "-D\"BAZEL_CURRENT_REPOSITORY=\"\"\"") ? "-DBAZEL_CURRENT_REPOSITORY=\"\"" : item);
 
         getOutputChannel().appendLine(`Compiling using: ${command} ${args.join(' ')}`);
+        getOutputChannel().appendLine(`cxxfiltExe: ${cxxfiltExe}`);
 
-        let commandOptions: SpawnOptionsWithStdioTuple<StdioNull, StdioPipe, StdioPipe> = { stdio: ['ignore', 'pipe', 'pipe'] }
+        const env: NodeJS.ProcessEnv = {
+            BAZEL_USE_CPP_ONLY_TOOLCHAIN: '1',
+            DEVELOPER_DIR: '/Applications/Xcode.app/Contents/Developer',
+            SDKROOT: '/Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX13.3.sdk',
+        };
+
+        let commandOptions: SpawnOptionsWithStdioTuple<StdioNull, StdioPipe, StdioPipe> = { stdio: ['ignore', 'pipe', 'pipe'], env };
+
         if (existsSync(ccommand.directory)) {
             commandOptions.cwd = ccommand.directory;
         }
         const cxx = spawn(command, args, commandOptions);
         const cxxfilt = spawn(cxxfiltExe, [], { stdio: ['pipe', 'pipe', 'pipe'] });
 
+        cxx.stdout.on('data', (data) => {
+            getOutputChannel().appendLine(`stdout: ${data}`);
+        });
+
+        cxx.stderr.on('data', (data) => {
+            getOutputChannel().appendLine(`stderr: ${data}`);
+        });
+
+        cxx.on('close', (code) => {
+            getOutputChannel().appendLine(`Compilation process exited with code ${code}`);
+        });
+
+        cxx.on('error', (error: Error) => {
+            throw new Error(`Compilation process got error ${error}`);
+        });
+
         try {
             cxxfilt.stdin.cork();
+
             for await (let chunk of cxx.stdout!) {
                 if (ctok.isCancellationRequested) throw new Error("operation cancelled");
                 cxxfilt.stdin.write(chunk);
+                getOutputChannel().appendLine(`1: ${cxxfiltExe}`);
+
             }
+            getOutputChannel().appendLine(`2: ${cxxfiltExe}`);
+
             cxxfilt.stdin.uncork();
             cxxfilt.stdin.end();
 
@@ -267,8 +315,11 @@ export class CompilationDatabase implements Disposable {
     }
 }
 
-export function constructCompileCommand(command: string, args: string[]): string[] {
-    if (command.length > 0) args = splitWhitespace(command);
+export function constructCompileCommand(command: string, args: string[], directory: string): string[] {
+    if (command.length > 0) {
+        args = splitWhitespace(command);
+    }
+    args[0] = directory + '/' + args[0];
 
     let isOutfile = false;
     args = args.filter(arg => {
